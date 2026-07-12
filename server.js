@@ -60,7 +60,7 @@ async function audit(admin, action, entityType, entityId, details = null) {
       details,
     });
 }
-app.get("/api/audit-logs", auth, allow("Super Admin"), async (req,res)=>{const {data,error}=await supabase.from("audit_logs").select("*").order("created_at",{ascending:false}).limit(500);if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,data})});
+app.get("/api/audit-logs", auth, async (req,res)=>{const {data,error}=await supabase.from("audit_logs").select("*").order("created_at",{ascending:false}).limit(500);if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,data})});
 app.get("/api/backups/members", auth, allow("Super Admin"), async (req,res)=>{const {data,error}=await supabase.from("members").select("*").order("id");if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,backup:{version:1,created_at:new Date().toISOString(),members:data}})});
 app.post("/api/backups/members/restore", auth, allow("Super Admin"), async (req,res)=>{try{const rows=req.body?.members;if(!Array.isArray(rows))return res.status(400).json({success:false,message:"Format backup tidak valid."});const {error:deleteError}=await supabase.from("members").delete().neq("id",0);if(deleteError)throw deleteError;const clean=rows.map(({id,created_at,updated_at,...m})=>({...m,id,updated_by:req.admin.name,updated_at:new Date().toISOString()}));const {data,error}=await supabase.from("members").insert(clean).select();if(error)throw error;await audit(req.admin,"restored","members","all",{count:data.length});res.json({success:true,message:"Backup berhasil dipulihkan.",data})}catch(e){res.status(500).json({success:false,message:e.message})}});
 
@@ -178,6 +178,10 @@ app.patch("/api/auth/profile", auth, async (req, res) => {
 app.get("/api/auth/me", auth, (req, res) =>
   res.json({ success: true, data: req.admin })
 );
+app.post("/api/auth/heartbeat", auth, async (req,res)=>{const {error}=await supabase.from("admin_users").update({last_seen_at:new Date().toISOString()}).eq("id",req.admin.id);if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true})});
+app.get("/api/admins/online", auth, allow("PJ Server","PJ Universal","Super Admin"), async (req,res)=>{const cutoff=new Date(Date.now()-2*60*1000).toISOString();const {data,error}=await supabase.from("admin_users").select("id,name,email,role,discord_avatar,last_seen_at").eq("is_active",true).gte("last_seen_at",cutoff).order("last_seen_at",{ascending:false});if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,data})});
+app.post("/api/auth/heartbeat", auth, async (req,res)=>{const {error}=await supabase.from("admin_users").update({last_seen:new Date().toISOString()}).eq("id",req.admin.id);if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true})});
+app.get("/api/admins/online", auth, allow("PJ Server","PJ Universal","Super Admin"), async (req,res)=>{const cutoff=new Date(Date.now()-120000).toISOString();const {data,error}=await supabase.from("admin_users").select("id,name,email,role,discord_avatar,last_seen").eq("is_active",true).gte("last_seen",cutoff).order("last_seen",{ascending:false});if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,data})});
 app.patch("/api/auth/profile", auth, async (req, res) => {
   try {
     const name = String(req.body.name || "").trim();
@@ -306,6 +310,7 @@ app.get("/api/members", async (req, res) => {
     const { data, error } = await supabase
       .from("members")
       .select("*")
+      .is("deleted_at", null)
       .order("generation", { ascending: true })
       .order("birth_date", { ascending: true, nullsFirst: false })
       .order("birth_order", { ascending: true, nullsFirst: false })
@@ -545,7 +550,7 @@ app.put(
 app.delete(
   "/api/members/:id",
   auth,
-  allow("PJ Server", "PJ Universal", "Super Admin"),
+  allow("PJ Universal", "Super Admin"),
   async (req, res) => {
     try {
       const memberId = optionalId(req.params.id);
@@ -590,10 +595,10 @@ app.delete(
         throw relationError.error;
       }
 
-      const { error: deleteError } = await supabase
-        .from("members")
-        .delete()
-        .eq("id", memberId);
+    const { error: deleteError } = await supabase
+      .from("members")
+      .update({ deleted_at: new Date().toISOString(), deleted_by: req.admin.name })
+      .eq("id", memberId);
 
       if (deleteError) throw deleteError;
       await audit(req.admin, "deleted", "member", memberId);
@@ -626,6 +631,8 @@ app.use((err, req, res, next) => {
     message: "Terjadi kesalahan pada server.",
   });
 });
+app.get("/api/members/recycle-bin", auth, allow("Super Admin"), async (req,res)=>{const {data,error}=await supabase.from("members").select("*").not("deleted_at","is",null).order("deleted_at",{ascending:false});if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,data})});
+app.patch("/api/members/:id/restore", auth, allow("Super Admin"), async (req,res)=>{const {data,error}=await supabase.from("members").update({deleted_at:null,deleted_by:null}).eq("id",req.params.id).select().single();if(error)return res.status(500).json({success:false,message:error.message});await audit(req.admin,"restored","member",req.params.id);res.json({success:true,data})});
 
 const PORT = process.env.PORT || 3000;
 
