@@ -9,7 +9,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 const app = express();
 
-const FRONTEND_ORIGIN = process.env.FRONTEND_URL || "http://localhost:5173";
+const FRONTEND_ORIGIN = process.env.FRONTEND_URL;
 const isProduction = process.env.NODE_ENV === "production";
 const ACCESS_COOKIE = "riverra_access";
 const REFRESH_COOKIE = "riverra_refresh";
