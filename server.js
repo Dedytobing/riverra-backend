@@ -5,6 +5,7 @@ const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const { sendAuditLog } = require("./src/services/discord-webhook.service");
 const JWT_SECRET = process.env.JWT_SECRET;
 
 const app = express();
@@ -128,7 +129,7 @@ const allow = (...roles) => async (req, res, next) => {
   }
 };
 async function audit(admin, action, entityType, entityId, details = null) {
-  await supabase
+  const { data, error } = await supabase
     .from("audit_logs")
     .insert({
       admin_id: admin.id,
@@ -137,9 +138,68 @@ async function audit(admin, action, entityType, entityId, details = null) {
       entity_type: entityType,
       entity_id: String(entityId),
       details,
-    });
+    })
+    .select()
+    .single();
+  if (error) throw error;
+
+  await deliverAuditLog(data);
+  return data;
+}
+async function updateAuditDelivery(log, values) {
+  const { error } = await supabase.from("audit_logs").update(values).eq("id", log.id);
+  if (error) throw error;
+}
+async function deliverAuditLog(log) {
+  const attempts = Number(log.discord_delivery_attempts || 0) + 1;
+  try {
+    await sendAuditLog(log);
+    await updateAuditDelivery(log, { discord_sent_at: new Date().toISOString(), discord_delivery_attempts: attempts, discord_last_error: null });
+    return true;
+  } catch (error) {
+    // Delivery failure must not undo a website update. Keep it in the retry queue.
+    try {
+      await updateAuditDelivery(log, { discord_delivery_attempts: attempts, discord_last_error: String(error.message || "Discord delivery failed").slice(0, 1000) });
+    } catch (statusError) {
+      console.error("Audit delivery status update failed:", statusError.message);
+    }
+    console.error("Discord audit notification failed:", error.message);
+    return false;
+  }
 }
 app.get("/api/audit-logs", auth, allow("PJ Server", "PJ Universal", "Super Admin"), async (req,res)=>{const {data,error}=await supabase.from("audit_logs").select("*").order("created_at",{ascending:false}).limit(500);if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,data})});
+app.get("/api/audit-logs/discord-status", auth, allow("Super Admin"), async (req, res) => {
+  const { count, error } = await supabase.from("audit_logs").select("id", { count: "exact", head: true }).is("discord_sent_at", null);
+  if (error) return res.status(500).json({ success: false, message: error.message });
+  res.json({ success: true, pending: count || 0 });
+});
+app.post("/api/audit-logs/discord-sync", auth, allow("Super Admin"), async (req, res) => {
+  try {
+    const pageSize = 500;
+    const pendingLogs = [];
+    for (let start = 0; ; start += pageSize) {
+      const { data, error } = await supabase
+        .from("audit_logs")
+        .select("*")
+        .is("discord_sent_at", null)
+        .order("created_at", { ascending: true })
+        .range(start, start + pageSize - 1);
+      if (error) throw error;
+      pendingLogs.push(...(data || []));
+      if (!data || data.length < pageSize) break;
+    }
+    let sent = 0;
+    let failed = 0;
+    for (const log of pendingLogs) {
+      if (await deliverAuditLog(log)) sent += 1;
+      else failed += 1;
+    }
+    const message = sent === 0 && failed === 0 ? "Tidak ada audit log pending untuk dikirim." : `${sent} audit log terkirim${failed ? `, ${failed} masih gagal.` : "."}`;
+    res.json({ success: true, message, sent, failed });
+  } catch (error) {
+    res.status(502).json({ success: false, message: error.message || "Sinkronisasi Discord gagal." });
+  }
+});
 app.get("/api/backups/members", auth, allow("Super Admin"), async (req,res)=>{const {data,error}=await supabase.from("members").select("*").order("id");if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,backup:{version:1,created_at:new Date().toISOString(),members:data}})});
 app.post("/api/backups/members/restore", auth, allow("Super Admin"), async (req,res)=>{try{const rows=req.body?.members;if(!Array.isArray(rows)||rows.length>10000)return res.status(400).json({success:false,message:"Format backup tidak valid."});const {data,error}=await supabase.rpc("restore_members_backup",{p_rows:rows,p_actor:req.admin.name});if(error)throw error;await audit(req.admin,"restored","members","all",{count:data?.length||0});res.json({success:true,message:"Backup berhasil dipulihkan.",data:data||[]})}catch(e){res.status(500).json({success:false,message:"Restore gagal. Tidak ada perubahan yang diterapkan."})}});
 

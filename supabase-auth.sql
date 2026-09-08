@@ -21,6 +21,10 @@ create table if not exists audit_logs (
   created_at timestamptz not null default now()
 );
 alter table audit_logs add column if not exists details jsonb;
+alter table audit_logs add column if not exists discord_sent_at timestamptz;
+alter table audit_logs add column if not exists discord_delivery_attempts integer not null default 0;
+alter table audit_logs add column if not exists discord_last_error text;
+create index if not exists audit_logs_discord_pending_idx on audit_logs (created_at asc) where discord_sent_at is null;
 alter table members add column if not exists updated_by text;
 alter table members add column if not exists updated_at timestamptz;
 alter table members add column if not exists birth_date date;
