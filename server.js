@@ -158,13 +158,36 @@ app.get("/api/auth/discord/callback", async (req, res) => {
     const profileResponse = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: `Bearer ${discordToken.access_token}` } });
     const profile = await profileResponse.json();
     if (!profileResponse.ok) throw new Error("Gagal mengambil profil Discord.");
-    const avatar = profile.avatar ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png` : null;
+    const avatarExtension = profile.avatar?.startsWith("a_") ? "gif" : "png";
+    const avatar = profile.avatar ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.${avatarExtension}?size=256` : null;
+    const bannerExtension = profile.banner?.startsWith("a_") ? "gif" : "png";
+    const banner = profile.banner ? `https://cdn.discordapp.com/banners/${profile.id}/${profile.banner}.${bannerExtension}?size=600` : null;
+    const avatarDecoration = profile.avatar_decoration_data || null;
+    const nameplate = profile.collectibles?.nameplate || null;
+    const primaryGuild = profile.primary_guild || null;
+    const discordProfile = {
+      discord_username: profile.username,
+      discord_global_name: profile.global_name || null,
+      discord_avatar: avatar,
+      discord_banner: banner,
+      discord_accent_color: profile.accent_color || null,
+      discord_avatar_decoration: avatarDecoration?.asset || null,
+      discord_avatar_decoration_sku_id: avatarDecoration?.sku_id || null,
+      discord_nameplate: nameplate?.asset || null,
+      discord_nameplate_sku_id: nameplate?.sku_id || null,
+      discord_nameplate_palette: nameplate?.palette || null,
+      discord_primary_guild_id: primaryGuild?.identity_guild_id || null,
+      discord_primary_guild_tag: primaryGuild?.tag || null,
+      discord_primary_guild_badge: primaryGuild?.badge || null,
+      discord_primary_guild_enabled: primaryGuild?.identity_enabled ?? null,
+      discord_profile_updated_at: new Date().toISOString(),
+    };
     let { data: admin } = await supabase.from("admin_users").select("*").eq("discord_id", profile.id).maybeSingle();
     if (!admin) {
-      const result = await supabase.from("admin_users").insert({ discord_id: profile.id, name: profile.global_name || profile.username, email: profile.email || `${profile.id}@discord.local`, discord_username: profile.username, discord_avatar: avatar, role: null, is_active: false }).select("*").single();
+      const result = await supabase.from("admin_users").insert({ discord_id: profile.id, name: profile.global_name || profile.username, email: profile.email || `${profile.id}@discord.local`, ...discordProfile, role: null, is_active: false }).select("*").single();
       if (result.error) throw result.error; admin = result.data;
     } else {
-      const result = await supabase.from("admin_users").update({ name: profile.global_name || profile.username, email: profile.email || admin.email, discord_username: profile.username, discord_avatar: avatar }).eq("id", admin.id).select("*").single();
+      const result = await supabase.from("admin_users").update({ name: profile.global_name || profile.username, email: profile.email || admin.email, ...discordProfile }).eq("id", admin.id).select("*").single();
       if (result.error) throw result.error; admin = result.data;
     }
     if (!admin.is_active || !admin.role) return res.redirect(`${FRONTEND_URL}/admin?auth_error=${encodeURIComponent("Akun Discord terdaftar, tetapi belum disetujui Super Admin.")}`);
@@ -215,12 +238,33 @@ app.get("/api/auth/me", auth, allow("PJ Server", "PJ Universal", "Super Admin"),
 );
 app.post("/api/auth/heartbeat", auth, allow("PJ Server", "PJ Universal", "Super Admin"), async (req,res)=>{const {error}=await supabase.from("admin_users").update({last_seen_at:new Date().toISOString()}).eq("id",req.admin.id);if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true})});
 app.get("/api/admins/online", auth, allow("PJ Server","PJ Universal","Super Admin"), async (req,res)=>{const cutoff=new Date(Date.now()-2*60*1000).toISOString();const {data,error}=await supabase.from("admin_users").select("id,name,email,role,discord_avatar,last_seen_at").eq("is_active",true).gte("last_seen_at",cutoff).order("last_seen_at",{ascending:false});if(error)return res.status(500).json({success:false,message:error.message});res.json({success:true,data})});
+// Public directory: deliberately expose only fields that are safe to publish.
+// The data is read from the same admin_users record updated by the profile endpoint,
+// so a renamed profile is reflected on the next directory request without duplication.
+app.get("/api/admins/directory", async (req, res) => {
+  const { data, error } = await supabase
+    .from("admin_users")
+    .select("id,name,role,discord_id,discord_username,discord_global_name,discord_avatar,discord_banner,discord_accent_color,discord_avatar_decoration,discord_avatar_decoration_sku_id,discord_nameplate,discord_nameplate_sku_id,discord_nameplate_palette,discord_primary_guild_id,discord_primary_guild_tag,discord_primary_guild_badge,discord_primary_guild_enabled,discord_profile_updated_at")
+    .eq("is_active", true)
+    .in("role", ROLES)
+    .order("role")
+    .order("name");
+  if (error) return res.status(500).json({ success: false, message: error.message });
+  res.set("Cache-Control", "no-store");
+  res.json({ success: true, data: data.map((admin) => ({
+    ...admin,
+    discord_profile_url: `https://discord.com/users/${admin.discord_id}`,
+    discord_dm_url: `discord://-/users/${admin.discord_id}`,
+  })) });
+});
 app.patch("/api/auth/profile", auth, allow("PJ Server", "PJ Universal", "Super Admin"), async (req, res) => {
   try {
     const name = String(req.body.name || "").trim();
     if (!name || name.length > 80) return res.status(400).json({ success:false, message:"Nama profil tidak valid." });
     const { data, error } = await supabase.from("admin_users").update({ name }).eq("id", req.admin.id).select("id,name,email,role,is_active,discord_avatar,discord_username,discord_id").single();
     if (error) throw error;
+    // Keep this request's actor metadata aligned with the canonical profile record.
+    req.admin.name = data.name;
     await audit(req.admin, "profile_updated", "admin", req.admin.id);
     res.json({ success:true, data });
   } catch (error) { res.status(500).json({ success:false, message:error.message }); }
