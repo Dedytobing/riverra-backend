@@ -893,7 +893,7 @@ async function destroyGalleryAsset(publicId) {
 
 app.get("/api/gallery", async (req, res) => {
   try {
-    const { data, error } = await supabase.from("gallery").select("id,name,src,caption,created_at,created_by,updated_at,updated_by,album_id,cloud_public_id").order("created_at", { ascending: false });
+    const { data, error } = await supabase.from("gallery").select("id,name,src,caption,created_at,created_by,updated_at,updated_by,album_id,cloud_public_id,sort_order").order("sort_order", { ascending: true }).order("created_at", { ascending: false });
     if (error) throw error;
     res.set("Cache-Control", "no-store");
     res.json({ success: true, data: await formatGalleryRows(data || []) });
@@ -928,8 +928,12 @@ app.post("/api/gallery/albums", auth, allow("gallery.add"), async (req, res) => 
     const category = String(req.body?.category || "Family Legacy").trim().slice(0, 80);
     const date = String(req.body?.date || "Current Collection").trim().slice(0, 80);
     const description = String(req.body?.description || "").trim().slice(0, 500);
+    const coverSrc = String(req.body?.coverSrc || "");
+    const coverPublicId = String(req.body?.coverPublicId || "");
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
     if (!name) return res.status(400).json({ success: false, message: "Nama album wajib diisi." });
-    const row = { id: crypto.randomUUID(), name, category_id: category.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 80) || "family-legacy", category_label: category, date_label: date, description, created_by: req.admin.id };
+    if (!cloudName || !coverSrc.startsWith(`https://res.cloudinary.com/${cloudName}/image/upload/`) || !/^riverra\/gallery\/[\w./-]+$/.test(coverPublicId)) return res.status(400).json({ success: false, message: "Cover album wajib berupa file Cloudinary yang valid." });
+    const row = { id: crypto.randomUUID(), name, category_id: category.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 80) || "family-legacy", category_label: category, date_label: date, description, cover_src: coverSrc, cover_public_id: coverPublicId, created_by: req.admin.id };
     const { data, error } = await supabase.from("gallery_albums").insert(row).select("*").single();
     if (error) throw error;
     await audit(req.admin, "created", "gallery_album", data.id, { name });
@@ -946,24 +950,45 @@ app.patch("/api/gallery/albums/:id", auth, allow("gallery.edit"), async (req, re
     const description = String(req.body?.description || "").trim().slice(0, 500);
     if (!name || !/^[\w-]{1,100}$/.test(id)) return res.status(400).json({ success: false, message: "ID dan nama album tidak valid." });
     const patch = { name, category_id: category.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 80) || "family-legacy", category_label: category, date_label: date, description, updated_by: req.admin.id, updated_at: new Date().toISOString() };
+    const coverSrc = req.body?.coverSrc === undefined ? null : String(req.body.coverSrc || "");
+    const coverPublicId = req.body?.coverPublicId === undefined ? null : String(req.body.coverPublicId || "");
+    if ((coverSrc === null) !== (coverPublicId === null)) return res.status(400).json({ success: false, message: "URL dan ID cover harus dikirim bersamaan." });
+    if (coverSrc !== null) {
+      const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+      if (!cloudName || !coverSrc.startsWith(`https://res.cloudinary.com/${cloudName}/image/upload/`) || !/^riverra\/gallery\/[\w./-]+$/.test(coverPublicId)) return res.status(400).json({ success: false, message: "Cover album Cloudinary tidak valid." });
+      patch.cover_src = coverSrc;
+      patch.cover_public_id = coverPublicId;
+    }
+    const { data: previousAlbum, error: previousError } = await supabase.from("gallery_albums").select("cover_public_id").eq("id", id).maybeSingle();
+    if (previousError) throw previousError;
     const { data, error } = await supabase.from("gallery_albums").update(patch).eq("id", id).select("*").maybeSingle();
     if (error) throw error;
     if (!data) return res.status(404).json({ success: false, message: "Album tidak ditemukan." });
+    let cleanupWarning = null;
+    if (coverSrc !== null && previousAlbum?.cover_public_id && previousAlbum.cover_public_id !== coverPublicId) {
+      try {
+        const { data: references, error: referenceError } = await supabase.from("gallery").select("id").eq("cloud_public_id", previousAlbum.cover_public_id).limit(1);
+        if (referenceError) throw referenceError;
+        if (!references?.length) await destroyGalleryAsset(previousAlbum.cover_public_id);
+      }
+      catch (cleanupError) { cleanupWarning = `Cover baru tersimpan, tetapi cover lama belum dapat dihapus dari Cloudinary: ${cleanupError.message}`; }
+    }
     await audit(req.admin, "edited", "gallery_album", id, { name });
     const [album] = await formatGalleryAlbums([data]);
-    res.json({ success: true, data: album });
+    res.json({ success: true, data: album, cleanupWarning });
   } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 app.delete("/api/gallery/albums/:id", auth, allow("gallery.delete"), async (req, res) => {
   const id = String(req.params.id || "");
   if (!/^[\w-]{1,100}$/.test(id)) return res.status(400).json({ success: false, message: "ID album tidak valid." });
   try {
-    const { data: album, error: albumError } = await supabase.from("gallery_albums").select("id,name").eq("id", id).maybeSingle();
+    const { data: album, error: albumError } = await supabase.from("gallery_albums").select("id,name,cover_public_id").eq("id", id).maybeSingle();
     if (albumError) throw albumError;
     if (!album) return res.status(404).json({ success: false, message: "Album tidak ditemukan." });
     const { data: photos, error: photoError } = await supabase.from("gallery").select("id,name,cloud_public_id").eq("album_id", id);
     if (photoError) throw photoError;
-    for (const photo of photos || []) await destroyGalleryAsset(photo.cloud_public_id);
+    const publicIds = new Set([...(photos || []).map((photo) => photo.cloud_public_id), album.cover_public_id].filter(Boolean));
+    for (const publicId of publicIds) await destroyGalleryAsset(publicId);
     const { error: rowsError } = await supabase.from("gallery").delete().eq("album_id", id);
     if (rowsError) throw rowsError;
     const { error: deleteError } = await supabase.from("gallery_albums").delete().eq("id", id);
@@ -992,12 +1017,32 @@ app.post("/api/gallery", auth, allow("gallery.add"), async (req, res) => {
       const { error } = await supabase.from("gallery_albums").insert({ id: albumId, name: albumName, category_id: String(albumInput.categoryId || "family-legacy").slice(0, 80), category_label: category, date_label: date, description: String(albumInput.description || "").slice(0, 500), cover_src: src, created_by: req.admin.id });
       if (error) throw error;
     }
-    const { data, error } = await supabase.from("gallery").insert({ name, src, caption: String(req.body?.caption || "").slice(0, 500), album_id: albumId, cloud_public_id: publicId, created_by: req.admin.id }).select().single();
+    const { data: orderRows, error: orderReadError } = await supabase.from("gallery").select("sort_order").eq("album_id", albumId).order("sort_order", { ascending: false }).limit(1);
+    if (orderReadError) throw orderReadError;
+    const sortOrder = (Number(orderRows?.[0]?.sort_order) || 0) + 1;
+    const { data, error } = await supabase.from("gallery").insert({ name, src, caption: String(req.body?.caption || "").slice(0, 500), album_id: albumId, cloud_public_id: publicId, sort_order: sortOrder, created_by: req.admin.id }).select().single();
     if (error) throw error;
     await audit(req.admin, "created", "gallery", data.id, { name, album_id: albumId, public_id: publicId });
     const [formatted] = await formatGalleryRows([data]);
     res.status(201).json({ success: true, data: formatted });
   } catch (error) { res.status(500).json({ success: false, message: error.message || "Foto gagal disimpan." }); }
+});
+app.patch("/api/gallery/albums/:id/photos/order", auth, allow("gallery.edit"), async (req, res) => {
+  const albumId = String(req.params.id || "");
+  const photoIds = req.body?.photoIds;
+  if (!/^[\w-]{1,100}$/.test(albumId) || !Array.isArray(photoIds) || photoIds.some((id) => !Number.isInteger(Number(id))) || new Set(photoIds.map(String)).size !== photoIds.length) return res.status(400).json({ success: false, message: "Daftar urutan foto tidak valid." });
+  try {
+    const { data: photos, error: readError } = await supabase.from("gallery").select("id").eq("album_id", albumId);
+    if (readError) throw readError;
+    const knownIds = new Set((photos || []).map((photo) => String(photo.id)));
+    if (knownIds.size !== photoIds.length || photoIds.some((id) => !knownIds.has(String(id)))) return res.status(400).json({ success: false, message: "Foto album berubah. Muat ulang album lalu coba lagi." });
+    for (let index = 0; index < photoIds.length; index += 1) {
+      const { error } = await supabase.from("gallery").update({ sort_order: index, updated_by: req.admin.id, updated_at: new Date().toISOString() }).eq("id", Number(photoIds[index])).eq("album_id", albumId);
+      if (error) throw error;
+    }
+    await audit(req.admin, "reordered", "gallery_album", albumId, { photo_count: photoIds.length });
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ success: false, message: error.message || "Urutan foto gagal disimpan." }); }
 });
 app.patch("/api/gallery/:id", auth, allow("gallery.edit"), async (req, res) => {
   const id = Number(req.params.id);
@@ -1035,15 +1080,33 @@ app.delete("/api/gallery/:id", auth, allow("gallery.delete"), async (req, res) =
   const { data: image, error: readError } = await supabase.from("gallery").select("id,name,album_id,cloud_public_id,src").eq("id", id).maybeSingle();
   if (readError) return res.status(500).json({ success: false, message: readError.message });
   if (!image) return res.status(404).json({ success: false, message: "Foto tidak ditemukan." });
-  try { await destroyGalleryAsset(image.cloud_public_id); }
-  catch (error) { return res.status(502).json({ success: false, message: error.message }); }
+  let isAlbumCover = false;
+  let nextPhoto = null;
+  let keepCoverAsset = false;
+  if (image.album_id) {
+    const { data: album, error: albumError } = await supabase.from("gallery_albums").select("cover_src,cover_public_id").eq("id", image.album_id).maybeSingle();
+    if (albumError) return res.status(500).json({ success: false, message: albumError.message });
+    isAlbumCover = album?.cover_public_id ? album.cover_public_id === image.cloud_public_id : album?.cover_src === image.src;
+    if (isAlbumCover) {
+      const { data, error } = await supabase.from("gallery").select("id,src,cloud_public_id").eq("album_id", image.album_id).neq("id", id).order("sort_order", { ascending: true }).order("created_at", { ascending: true }).limit(1).maybeSingle();
+      if (error) return res.status(500).json({ success: false, message: error.message });
+      nextPhoto = data;
+      if (nextPhoto) {
+        const { error: coverError } = await supabase.from("gallery_albums").update({ cover_src: nextPhoto.src, cover_public_id: nextPhoto.cloud_public_id || null }).eq("id", image.album_id);
+        if (coverError) return res.status(500).json({ success: false, message: `Cover tidak dapat dialihkan ke foto berikutnya: ${coverError.message}` });
+      } else keepCoverAsset = true;
+    }
+  }
+  if (!keepCoverAsset && image.cloud_public_id) {
+    try {
+      const { data: references, error: referenceError } = await supabase.from("gallery").select("id").eq("cloud_public_id", image.cloud_public_id).neq("id", id).limit(1);
+      if (referenceError) throw referenceError;
+      if (!references?.length) await destroyGalleryAsset(image.cloud_public_id);
+    }
+    catch (error) { return res.status(502).json({ success: false, message: error.message }); }
+  }
   const { error } = await supabase.from("gallery").delete().eq("id", id);
   if (error) return res.status(500).json({ success: false, message: `File Cloudinary terhapus, tetapi catatan galeri gagal dihapus: ${error.message}` });
-  if (image.album_id) {
-    const { data: nextPhoto } = await supabase.from("gallery").select("src").eq("album_id", image.album_id).order("created_at", { ascending: true }).limit(1).maybeSingle();
-    if (nextPhoto) await supabase.from("gallery_albums").update({ cover_src: nextPhoto.src }).eq("id", image.album_id);
-    else await supabase.from("gallery_albums").update({ cover_src: null }).eq("id", image.album_id);
-  }
   await audit(req.admin, "deleted", "gallery", id, { name: image.name, cloud_public_id: image.cloud_public_id });
   res.json({ success: true });
 });
